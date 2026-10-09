@@ -1,0 +1,105 @@
+# Redis-like server — milestone 1: RESP2
+
+Linux / WSL, C++17. This is a learning project with a focused RESP2 subset.
+It implements PING [message] and ECHO message. There is no database yet.
+
+## Build and run
+
+From this directory:
+
+```bash
+make
+./build/server
+```
+
+In another WSL terminal, in the same directory:
+
+```bash
+./build/client
+```
+
+Try:
+
+```text
+PING
+ECHO "hello world"
+ECHO ""
+ping hello
+SET name Vishnu
+exit
+```
+
+The SET command intentionally returns an unknown-command error; storage comes later.
+The interactive client keeps one connection open. `exit` is a local client action.
+Its input syntax supports double-quoted arguments, not full shell/redis-cli syntax.
+Inside double quotes, backslash escapes the following character; it does not decode
+textual sequences such as `\n` into control bytes. The wire protocol itself is binary-safe.
+
+One command per invocation also works (your shell processes the quotes):
+
+```bash
+./build/client PING
+./build/client ECHO "hello world"
+```
+
+Stop the server using Ctrl+C. Run `make test` with no server already occupying 6379.
+Tests require Python 3. If port 6379 is occupied, change `net::Port` in common/net.h
+and rebuild both programs; integration.py uses 6379 and must be updated too.
+
+## File responsibilities and reading order
+
+1. common/resp.h: parser contracts and limits.
+2. common/resp.cpp: encoding and parsing, independent of sockets.
+3. common/net.h: socket ownership, blocking receive and send-all helpers.
+4. server/main.cpp: listen/accept, thread per connection, parse/execute/reply loop.
+5. client/main.cpp: connect, turn user arguments into RESP, decode replies.
+6. tests/: parser boundary checks and actual TCP round trips.
+
+The client and server are separate executables. Each compiles its own copy of
+common/resp.cpp; sharing source does not mean sharing runtime memory.
+
+## How the server works
+
+Each client thread owns its socket and input buffer. Parse the buffer first:
+- Complete: execute exactly one command, send the entire reply, remove the consumed
+  bytes, then parse again. Extra commands remain available in the buffer.
+- Incomplete: receive more bytes and append them; keep the old bytes.
+- Error: send a protocol error if possible and close the connection.
+
+The parser accepts nonempty arrays of non-null bulk strings. It checks declared
+lengths before copying data. Limits: 128 arguments, 64 KiB per argument, 1 MiB per
+encoded command, 20 decimal digits per length header. It reparses incomplete input
+from the start for clarity; a resumable parser and buffer cursor are later optimizations.
+Each receive appends at most 4096 bytes, so buffered data may briefly include bytes
+from a following frame. Per-frame limits are independent of that extra data.
+
+Only simple strings, errors, and non-null bulk strings are decoded as replies.
+Integers, nulls, nested arrays, RESP3, inline commands, authentication, persistence,
+and Redis client handshake commands are outside this milestone.
+
+Command names are ASCII case-insensitive. Values retain their original bytes.
+The response line encoders are for single-line text only; arbitrary values use bulk().
+sendAll retries partial writes and EINTR; MSG_NOSIGNAL is Linux-specific.
+Socket uses RAII to close descriptors on handler return. EOF during a request is
+treated as truncation. A command error leaves the connection open.
+
+This stage keeps the thread-per-connection model. Threads own no shared database yet.
+There is no connection cap, idle timeout, or graceful shutdown/drain mechanism;
+the listener is bound to loopback for local learning. Later the event loop replaces
+these detached client threads, and nonblocking writes use per-connection output buffers.
+
+## Incremental progression
+
+This adapts the supplied book's progression:
+- Chapter 4: this RESP protocol milestone (instead of the book's custom framing).
+- Chapters 5–6: nonblocking sockets, poll(), connection state, input/output buffers.
+- Chapter 7: SET, GET, DEL and initial in-memory storage.
+- Chapter 8: custom hash table and incremental rehashing.
+- Chapter 9: expand RESP response types instead of custom serialization.
+- Chapters 10–11: AVL tree and sorted sets.
+- Chapters 12–13: idle timers, a min-heap, and key expiration.
+- Chapter 14: selected background work using a thread pool.
+
+Start by tracing encodeCommand({"ECHO", "hello"}), then Reader::readBulk(),
+parseCommand(), handleClient(), and query(). Do not add storage until the protocol
+tests and repeat requests on one connection are understood.
