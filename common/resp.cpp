@@ -1,4 +1,5 @@
 #include "resp.h"
+#include <charconv>
 #include <utility>
 
 namespace resp {//This namespace is named namespace used for avoiding collisions with function/entity names
@@ -23,6 +24,18 @@ struct Reader {
     std::size_t pos = 0; //Keeps track of the location where the reader is currently at
     Status status = Status::Complete;
     std::string message; //if there is an error this is what stores the error description
+
+    bool line(std::string_view& value) {
+        const auto end = input.find("\r\n", pos);
+        if (end == std::string_view::npos) {
+            // Request one more byte to distinguish incomplete from oversized.
+            return need(input.size() - pos + 1);
+        }
+        if (!need(end - pos + 2)) return false;
+        value = input.substr(pos, end - pos);
+        pos = end + 2;
+        return true;
+    }
 
     /*
     funnction that sets the reader structs field values when parsing fails
@@ -196,48 +209,77 @@ CommandResult parseCommand(std::string_view input) { //return type of this is th
 /*
 This parses the responses from the server 
 */
-ReplyResult parseReply(std::string_view input) {
-    ReplyResult result;
-    if (input.empty()) return result;
-    result.type = input[0];//The first char tells the type of result
-    if (result.type == '$') {// $ means bulk string
-        Reader reader{input, 0, Status::Complete, {}};
-        if (!reader.readBulk(result.value)) { //parse the bulk string
-            result.status = reader.status;
-            result.error = reader.message;
-            return result;
-        }
-        result.consumed = reader.pos;
-    } 
-    else if (result.type == '+' || result.type == '-') {
-        const auto end = input.find("\r\n", 1); //search for the \r\n substring starting from pos 1(pos 1 becasue 0 contains + or -)
-        if (end == std::string_view::npos) {//npos means not found-->therefore if the \r\n wasnt found then it is possible that the reply is just incomplete
-            if (input.size() >= MaxFrame) {//but if the inout size is already greater than the MaxFram size then it is invalid
-                result.status = Status::Error;
-                result.error = "reply too large";
-            }
-            return result; //this occurs on every call-here we dont set the status to error of input size>maxFram-so by defualt this sends the result with status incomplete
-        }
-        if (end + 2 > MaxFrame) { //check if the total length is less than the MaxFrame size
-            result.status = Status::Error;
-            result.error = "invalid reply line";
-            return result;
-        }
-        result.value = std::string(input.substr(1, end - 1));
-        result.consumed = end + 2;
-    } 
-    
-    /*
-    If any other character type for the first elemetn then it is not deifned and hence error
-    */
-    else {
-        result.status = Status::Error;
-        result.error = "unsupported reply type";
-        return result;
+namespace {
+template <typename Number>
+bool replyNumber(Reader& reader, std::string_view text, Number& value) {
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+        return reader.fail("invalid reply number");
     }
+    return true;
+}
 
-    //Finally if we reach here successuly then the reply has been recieved and parsed successfully
+bool readReply(Reader& reader, ReplyResult& result, unsigned depth) {
+    if (depth > 32) return reader.fail("reply nesting too deep");
+    if (!reader.need(1)) return false;
+    const auto start = reader.pos;
+    result.type = reader.input[reader.pos++];
+    std::string_view line;
+    if (result.type != '+' && result.type != '-' && result.type != ':' &&
+        result.type != '$' && result.type != '*') return reader.fail("unsupported reply type");
+    if (!reader.line(line)) return false;
+
+    if (result.type == '+' || result.type == '-') {
+        result.value = line;
+    } else if (result.type == ':') {
+        if (!replyNumber(reader, line, result.integer)) return false;
+    } else if (line == "-1") {
+        result.isNull = true; // Null bulk string or null array.
+    } else {
+        std::size_t length = 0;
+        if (!replyNumber(reader, line, length)) return false;
+        if (result.type == '$') {
+            if (length > MaxBulk) return reader.fail("length exceeds limit");
+            if (!reader.need(length + 2)) return false;
+            if (reader.input[reader.pos + length] != '\r' ||
+                reader.input[reader.pos + length + 1] != '\n') {
+                return reader.fail("missing bulk string terminator");
+            }
+            result.value = reader.input.substr(reader.pos, length);
+            reader.pos += length + 2;
+        } else {
+            // Even the smallest child consumes at least three wire bytes.
+            if (length > MaxFrame / 3) return reader.fail("array length exceeds limit");
+            for (std::size_t i = 0; i < length; ++i) {
+                ReplyResult child;
+                if (!readReply(reader, child, depth + 1)) return false;
+                result.elements.push_back(std::move(child));
+            }
+        }
+    }
     result.status = Status::Complete;
+    result.consumed = reader.pos - start;
+    return true;
+}
+} // namespace
+
+ReplyResult parseReply(std::string_view input) {
+    Reader reader{input, 0, Status::Complete, {}};
+    ReplyResult result;
+    if (!readReply(reader, result, 0)) {
+        result.status = reader.status;
+        result.error = reader.message;
+        result.elements.clear();
+        result.consumed = 0;
+    }
     return result;
 }
+
+std::string nullBulk() { return "$-1\r\n"; }
+std::string integer(std::int64_t value) { return ":" + std::to_string(value) + "\r\n"; }
+std::string array(const std::vector<std::string>& encodedElements) {
+    std::string result = "*" + std::to_string(encodedElements.size()) + "\r\n";
+    for (const auto& element : encodedElements) result += element;
+    return result;
 }
+} // namespace resp

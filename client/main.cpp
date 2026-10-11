@@ -7,6 +7,21 @@
 #include <iostream>
 #include <sstream>
 
+void printReply(const resp::ReplyResult& reply, const std::string& indent = "") {
+    if (reply.isNull) std::cout << "(nil)\n";
+    else if (reply.type == ':') std::cout << "(integer) " << reply.integer << '\n';
+    else if (reply.type == '*') {
+        if (reply.elements.empty()) std::cout << "(empty array)\n";
+        for (std::size_t i = 0; i < reply.elements.size(); ++i) {
+            std::cout << indent << i + 1 << ") ";
+            printReply(reply.elements[i], indent + "   ");
+        }
+    } else {
+        if (reply.type == '-') std::cout << "(error) ";
+        std::cout << reply.value << '\n';
+    }
+}
+
 bool query(int fd, const std::vector<std::string>& args, std::string& input) {
     if (args.empty() || args.size() > resp::MaxArgs) {
         std::cerr << "Command must have 1..128 arguments\n"; 
@@ -39,8 +54,7 @@ bool query(int fd, const std::vector<std::string>& args, std::string& input) {
         }
 
         if (reply.status == resp::Status::Complete) { //if the repsonse is complete that means we have recieved the full response
-            if (reply.type == '-') std::cout << "(error) "; //if the reply type is error then just prefix (error) in front of the actual output
-            std::cout << reply.value << '\n'; //preint the actual output
+            printReply(reply);
             input.erase(0, reply.consumed); //clear the input buffer uptill whatever is consumed
             return true;
         }
@@ -90,7 +104,8 @@ int main(int argc, char* argv[]) {
     }
 
     //Otherwise if we are just starting the client then it should handle multiple commands hence we will setup the loop
-    std::cout << "Commands: PING, ECHO \"hello world\". Type exit to leave.\n";
+    std::cout << "Commands: PING, ECHO, GET, SET, DEL, KEYS, ZADD, ZREM, ZSCORE, ZRANK, ZCARD, ZQUERY.\n"
+              << "See docs/COMMANDS.md for syntax. Type exit to leave.\n";
     std::string line;
     while (std::cout << "redis> " && std::getline(std::cin, line)) { //print redis> and wait for the user to enter a line and input and store that line in the line variable
         if (line == "exit") break; // Local UI action, not a server command.

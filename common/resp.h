@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -52,7 +53,7 @@ struct CommandResult {
 
 /*
 This is the client side result(this is how the response from the server is stored client side)
-type-->tells which of the tye of resonse strings it is: + is simple string, - is error, $ is bulk string
+type-->RESP2 prefix: + simple, - error, $ bulk/null, : integer, * array/null
 consumed-->again smae thing here- the bytes may contain bytes form a different response as well hence to clealry identify when the current response is over
 */
 struct ReplyResult {
@@ -61,6 +62,9 @@ struct ReplyResult {
     std::string value;
     std::size_t consumed = 0;
     std::string error;
+    bool isNull = false;
+    std::int64_t integer = 0;
+    std::vector<ReplyResult> elements;
 };
 
 //Hwere we are declaring functions. The imlemetatiosn will be in the .cpp file 
@@ -68,7 +72,11 @@ std::string encodeCommand(const std::vector<std::string>& arguments);
 std::string simple(std::string_view value);
 std::string error(std::string_view value);
 std::string bulk(std::string_view value);
+std::string nullBulk();
+std::string integer(std::int64_t value);
+// Elements are already encoded RESP replies, allowing arrays of mixed types.
+std::string array(const std::vector<std::string>& encodedElements);
 CommandResult parseCommand(std::string_view input);
-// This milestone decodes only simple strings, errors, and non-null bulk strings.
+// Decodes RESP2 simple/error strings, bulk strings, nulls, integers, and arrays.
 ReplyResult parseReply(std::string_view input);
 }

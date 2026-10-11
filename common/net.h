@@ -5,6 +5,7 @@
 #include <string_view>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <utility>
 
 namespace net {
 constexpr unsigned short Port = 6379;
@@ -27,11 +28,14 @@ public:
     */
     Socket(const Socket&) = delete; //prevents the copy constructor- Socket s2=s1; -->will give error
     Socket& operator=(const Socket&) = delete; //prevents assignement Socket s1(5), Socket s2(6); s1=s2-->will give error
+
+    // Transfer ownership to an event-loop connection without duplicating the fd.
+    Socket(Socket&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
     
     int get() const { return fd_; } //returns the fd
 };
 
-// Blocking sockets only. Nonblocking writes will use an output buffer later.
+// sendAll is for blocking sockets only. The event loop has its own write handler.
 
 /*
 This function basically guarantees that the entire message is sent. send() doesnt guarantee this

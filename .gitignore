@@ -1,0 +1,25 @@
+# Compiled executables and test outputs; keep the Makefile in Git.
+/build/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+
+# Python test caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local book PDFs, downloaded metadata, and reference excerpts.
+/local-reference/
+/sampleEventLoop.txt
+build-your-own-redis*
+*.pdf
+*:Zone.Identifier
+
+# Local metadata for the separate Sites-hosted copy.
+**/.openai/
+
+# visualizer/dist/ contains the webpage source and must stay tracked for Pages.

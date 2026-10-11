@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Step through Redis Lite's client request, nonblocking event loop, offset input buffer, storage operations, and RESP2 reply.">
+  <meta name="theme-color" content="#f5f6f2">
+  <title>Redis Lite · Request Flow</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="model.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./index.html" aria-label="Redis Lite request walkthrough">
+      <svg width="27" height="27" viewBox="0 0 27 27" aria-hidden="true"><path d="M13.5 2 25 7.7 13.5 13.4 2 7.7Z M2 13.1l11.5 5.7L25 13.1 M2 18.5l11.5 5.7L25 18.5" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linejoin="round"/></svg>
+      <strong>redis<span>lite</span></strong><span class="brand-divider"></span><span class="brand-sub">request explorer</span>
+    </a>
+    <div class="mode-label"><span class="status-dot"></span> Event loop <span> / </span> Offset buffer</div>
+  </header>
+
+  <main>
+    <section class="intro">
+      <div><p class="eyebrow">INSIDE THE SERVER</p><h1>One request. <span>Every step.</span></h1><p class="subtitle">Follow the bytes from client to command, through memory, and back again.</p></div>
+      <span class="simulation-badge"><span class="status-dot"></span> Interactive simulation</span>
+    </section>
+
+    <section class="scenario-bar" aria-label="Choose a request scenario">
+      <div class="scenario-picker"><label for="scenario">EXPLORE A SCENARIO</label><select id="scenario">
+        <option value="normal">01 / A complete request</option><option value="fragmented">02 / Fragmented input</option><option value="pipeline">03 / Pipelined commands</option><option value="partial">04 / Partial writes + EAGAIN</option><option value="compaction">05 / Buffer compaction</option><option value="sorted">06 / Sorted-set storage</option><option value="protocol">07 / A protocol error</option>
+      </select></div>
+      <div class="scenario-summary"><code id="command-preview">GET greeting</code><p id="scenario-description"></p></div>
+      <button class="quiet-button" id="customize" aria-expanded="false" aria-controls="custom-panel">Edit &amp; explore <span aria-hidden="true">↗</span></button>
+    </section>
+    <form id="custom-panel" class="custom-panel" hidden>
+      <div class="command-editor"><label for="commands">Commands <span>one per line; double quotes group spaces</span></label><textarea id="commands" rows="3" spellcheck="false">GET greeting</textarea></div>
+      <div class="transport-settings">
+        <label for="fragment">Request delivery<select id="fragment"><option value="0">All bytes available</option><option value="8">8 bytes per poll cycle</option><option value="16">16 bytes per poll cycle</option><option value="60">60 bytes per poll cycle</option></select></label>
+        <label for="write-chunk">Accepted per send<select id="write-chunk"><option value="0">Full available reply</option><option value="5">5 bytes</option><option value="8">8 bytes</option></select></label>
+        <label for="capacity">Illustrative initial capacity<select id="capacity"><option value="32">32 bytes</option><option value="64" selected>64 bytes</option><option value="128">128 bytes</option></select></label>
+        <label class="check-label"><input type="checkbox" id="block-once"> Simulate EAGAIN after first send</label>
+        <button class="primary-button" type="submit">Build this trace <span aria-hidden="true">→</span></button>
+      </div>
+      <p id="input-error" role="alert"></p>
+    </form>
+
+    <div class="workspace">
+      <div class="main-column">
+        <section class="flow-panel panel" aria-label="Animated request path">
+          <div class="panel-heading"><h2>The request journey</h2><span class="small-label">CLICK A STAGE TO JUMP</span></div>
+          <div class="flow-status"><span><span class="live-dot"></span> poll cycle <b id="cycle">0</b></span><span class="state-token" id="state-token">Conn not created</span><span class="event-label" id="event-label">waiting to start</span></div>
+          <div class="diagram-wrap">
+            <svg id="flow-diagram" viewBox="0 0 1100 354" role="img" aria-labelledby="diagram-title diagram-desc">
+              <title id="diagram-title">Client to Redis Lite event-loop server and back</title><desc id="diagram-desc">Client encoding, poll, read, offset input buffer, parser, command processor, storage, reply encoding, nonblocking write, and client decoding.</desc>
+              <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#a3b0aa"/></marker><marker id="arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#477769"/></marker></defs>
+              <rect class="client-boundary" x="12" y="18" width="188" height="320" rx="13"/><rect class="server-boundary" x="250" y="18" width="838" height="320" rx="13"/>
+              <text class="room-label" x="30" y="42">CLIENT</text><text class="room-label" x="271" y="42">SERVER · ONE EVENT-LOOP THREAD</text><text class="room-sub" x="1068" y="42" text-anchor="end">fd2Conn[fd] → Conn</text>
+              <path id="edge-network" class="flow-edge" d="M185 111 H280"/><path id="edge-read" class="flow-edge" d="M430 111 H485"/><path id="edge-buffer" class="flow-edge" d="M635 111 H690"/><path id="edge-parser" class="flow-edge" d="M840 111 H890"/>
+              <path id="edge-command" class="flow-edge" d="M965 149 V233"/><path id="edge-storage" class="flow-edge" d="M890 271 H840"/><path id="edge-reply" class="flow-edge" d="M690 271 H635"/><path id="edge-write" class="flow-edge" d="M485 271 H430"/><path id="edge-decode" class="flow-edge" d="M280 271 H185"/>
+              <text class="wire-caption" x="232" y="91" text-anchor="middle">TCP</text><text class="wire-caption" x="232" y="302" text-anchor="middle">TCP</text><text class="wire-count" id="request-count" x="232" y="131" text-anchor="middle">—</text><text class="wire-count" id="reply-count" x="232" y="252" text-anchor="middle">—</text>
+              <g class="flow-node" data-stage="encode" tabindex="0" role="button" aria-label="Jump to client request encoding" transform="translate(30 73)"><rect width="155" height="76" rx="10"/><text class="node-number" x="12" y="22">01</text><text class="node-title" x="12" y="43">Encode request</text><text class="node-function" x="12" y="61">encodeCommand()</text></g>
+              <g class="flow-node" data-stage="poll" tabindex="0" role="button" aria-label="Jump to poll dispatch" transform="translate(280 73)"><rect width="150" height="76" rx="10"/><text class="node-number" x="12" y="22">02</text><text class="node-title" x="12" y="43">Wait &amp; dispatch</text><text class="node-function" x="12" y="61">poll() · fd2Conn</text></g>
+              <g class="flow-node" data-stage="read" tabindex="0" role="button" aria-label="Jump to read handler" transform="translate(485 73)"><rect width="150" height="76" rx="10"/><text class="node-number" x="12" y="22">03</text><text class="node-title" x="12" y="43">Read bytes</text><text class="node-function" x="12" y="61">handleRead()</text></g>
+              <g class="flow-node buffer-node" data-stage="buffer" tabindex="0" role="button" aria-label="Jump to offset input buffer" transform="translate(690 73)"><rect width="150" height="76" rx="10"/><text class="node-number" x="12" y="22">04 · OFFSET FIFO</text><text class="node-title" x="12" y="43">Retain unread bytes</text><text class="node-function" x="12" y="61">InputBuffer</text></g>
+              <g class="flow-node" data-stage="parser" tabindex="0" role="button" aria-label="Jump to RESP2 command parsing" transform="translate(890 73)"><rect width="150" height="76" rx="10"/><text class="node-number" x="12" y="22">05</text><text class="node-title" x="12" y="43">Parse one command</text><text class="node-function" x="12" y="61">parseCommand()</text></g>
+              <g class="flow-node" data-stage="command" tabindex="0" role="button" aria-label="Jump to command execution" transform="translate(890 233)"><rect width="150" height="76" rx="10"/><text class="node-number" x="12" y="22">06</text><text class="node-title" x="12" y="43">Execute arguments</text><text class="node-function" x="12" y="61">CommandProcessor</text></g>
+              <g class="flow-node" data-stage="storage" tabindex="0" role="button" aria-label="Jump to custom storage" transform="translate(690 233)"><rect width="150" height="76" rx="10"/><text class="node-number" x="12" y="22">07</text><text class="node-title" x="12" y="43">Read / update data</text><text class="node-function" x="12" y="61">Storage interface</text></g>
+              <g class="flow-node" data-stage="reply" tabindex="0" role="button" aria-label="Jump to RESP2 reply encoding" transform="translate(485 233)"><rect width="150" height="76" rx="10"/><text class="node-number" x="12" y="22">08</text><text class="node-title" x="12" y="43">Prepare one reply</text><text class="node-function" x="12" y="61">conn.output</text></g>
+              <g class="flow-node" data-stage="write" tabindex="0" role="button" aria-label="Jump to nonblocking reply writing" transform="translate(280 233)"><rect width="150" height="76" rx="10"/><text class="node-number" x="12" y="22">09 · NONBLOCKING</text><text class="node-title" x="12" y="43">Send what fits</text><text class="node-function" x="12" y="61">handleWrite()</text></g>
+              <g class="flow-node" data-stage="decode" tabindex="0" role="button" aria-label="Jump to client reply decoding" transform="translate(30 233)"><rect width="155" height="76" rx="10"/><text class="node-number" x="12" y="22">10</text><text class="node-title" x="12" y="43">Decode &amp; print</text><text class="node-function" x="12" y="61">parseReply()</text></g>
+              <text class="diagram-note" x="668" y="194" text-anchor="middle">The highlighted stage is the current call. The timeline also shows returns and repeated calls.</text>
+              <circle id="packet" r="4" cx="0" cy="0"/>
+            </svg>
+          </div>
+          <div class="request-wire"><div><span>ENCODED REQUEST</span><span id="network-remaining">0 B awaiting server recv</span></div><code id="encoded-request">Arguments have not been encoded yet.</code></div>
+          <div class="journey-caption"><span class="legend-dot"></span> Active function <span class="caption-separator">·</span> <span id="journey-context">Client-side arguments, before encoding</span></div>
+        </section>
+
+        <section class="buffer-panel panel" aria-labelledby="buffer-title">
+          <div class="panel-heading"><h2 id="buffer-title">Inside <code>InputBuffer</code></h2><button class="text-button" id="byte-format" aria-pressed="false">Show hex</button></div>
+          <div class="buffer-metrics"><div><span>READ OFFSET</span><strong id="buffer-begin">0 <small>B</small></strong></div><div><span>STORED</span><strong id="buffer-size">0 <small>B</small></strong></div><div><span>UNREAD</span><strong id="buffer-unread">0 <small>B</small></strong></div><div><span>TAIL ROOM</span><strong id="buffer-spare">64 <small>B</small></strong></div><div class="copied-metric"><span>COMPACTION COPIES</span><strong id="buffer-copied">0 <small>B</small></strong></div></div>
+          <div class="buffer-key"><span><i class="consumed-key"></i> consumed prefix</span><span><i class="unread-key"></i> unread bytes</span><span><i class="cursor-key"></i> begin_</span><span class="capacity-note" id="capacity-note">capacity: 64 B (illustrative)</span></div>
+          <div id="byte-strip" class="byte-strip" role="group" aria-label="Physical input-buffer bytes"></div>
+          <div class="view-row"><code>input.view()</code><span aria-hidden="true">→</span><code id="input-view">empty</code></div>
+          <p class="panel-footnote">Consuming advances an offset. Append compacts only when tail space is insufficient and at least half of the stored bytes have been consumed. Capacity and growth sizes are illustrative.</p>
+        </section>
+
+        <div class="data-panels">
+          <section class="panel parser-panel"><div class="panel-heading"><h2>Parser result</h2><span class="mini-badge" id="parser-status">not called</span></div><div id="argument-list" class="argument-list"><span class="empty-label">Arguments appear when one command is complete.</span></div><div class="parser-footer"><code>consumed = <b id="parser-consumed">0</b></code><span id="parser-position">cursor: 0</span></div></section>
+          <section class="panel reply-panel"><div class="panel-heading"><h2>Pending reply</h2><span class="small-label" id="sent-label">sent 0 / 0 B</span></div><pre id="pending-reply" class="wire-pre">No output queued</pre><div class="write-progress"><div id="write-progress-fill"></div></div><div class="parser-footer"><code>output.data() + sent</code><span id="pending-remaining">0 B remaining</span></div></section>
+        </div>
+
+        <div class="data-panels">
+          <section class="panel database-panel"><div class="panel-heading"><h2>The shared database</h2><span class="small-label">IN MEMORY</span></div><div id="database"></div><p id="storage-operation" class="storage-operation">Storage operations appear here.</p></section>
+          <section class="panel client-panel"><div class="panel-heading"><h2>Back at the client</h2><span class="small-label" id="client-byte-count">0 B buffered</span></div><pre id="client-input" class="wire-pre">Waiting for reply bytes</pre><div id="client-replies" class="client-replies" aria-label="Decoded client replies"><span class="empty-label">Decoded replies appear here.</span></div></section>
+        </div>
+
+        <details class="scope-notes"><summary>What this walkthrough models</summary><p>The JavaScript simulator follows the current <code>event_loop.cpp</code>, RESP2 parser, and <code>InputBuffer</code> control flow. It does not connect to a running server. Timing, socket delivery, allocation capacity, and seeded data are chosen for teaching, not measured performance.</p><p>The diagram is a map of interacting objects, not a straight-line call stack. Parsing happens before receiving; PING/ECHO bypass storage; consuming revisits the buffer; a drained reply rechecks pipeline input. The step timeline is the exact order for the chosen scenario.</p><p>Storage results are modeled at the interface boundary. The C++ hash table and AVL internals are summarized rather than reimplemented. The pipeline scenario uses a protocol demo client; the repository CLI waits for one reply per <code>query()</code>. This trace focuses on one connection. The server also handles multiple clients, EINTR, I/O failures, EOF, and accept/read/write budgets.</p></details>
+      </div>
+
+      <aside class="inspector panel" aria-label="Current function and connection state">
+        <div class="inspector-top"><span class="eyebrow">CURRENT STEP</span><span id="step-label">01 / 01</span></div>
+        <div class="step-indicator" id="step-indicator"><span>→</span><span id="stage-label">CLIENT</span></div>
+        <h2 id="step-title">Start with command arguments</h2><p id="step-detail"></p>
+        <div class="function-call"><span>FUNCTION / OBJECT</span><code id="function-call"></code></div>
+        <div class="snapshot-title"><h3>Conn snapshot</h3><span id="conn-exists">not created</span></div>
+        <dl class="conn-snapshot"><div><dt>state</dt><dd id="conn-state">—</dd></div><div><dt>next poll interest</dt><dd id="conn-interest">—</dd></div><div><dt>sent</dt><dd id="conn-sent">0</dd></div><div><dt>closeAfterWrite</dt><dd id="conn-close">false</dd></div><div class="snapshot-subheading">HANDLER LOCALS / COMMAND PROCESSOR</div><div><dt>received (local)</dt><dd id="conn-received">0 B</dd></div><div><dt>written (local)</dt><dd id="conn-written">0 B</dd></div><div><dt>storage mutex</dt><dd id="conn-mutex">unlocked</dd></div></dl>
+        <details class="source-details" open><summary><span>Code behind this step</span><span aria-hidden="true">⌄</span></summary><p id="source-file"></p><pre><code id="source-code"></code></pre></details>
+        <div class="trace-heading"><h3>Recent calls</h3><span>click to revisit</span></div><ol id="event-log" class="event-log"></ol>
+      </aside>
+    </div>
+  </main>
+
+  <footer class="playback" aria-label="Playback controls">
+    <div class="transport-buttons"><button id="restart" class="icon-button" aria-label="Restart trace" title="Restart">↺</button><button id="previous" class="icon-button" aria-label="Previous step" title="Previous (left arrow)">‹</button><button id="play" class="play-button" aria-label="Play trace"><span id="play-icon" aria-hidden="true">▶</span> <span id="play-text">Play trace</span></button><button id="next" class="icon-button" aria-label="Next step" title="Next (right arrow)">›</button></div>
+    <div class="timeline-wrap"><label for="timeline" class="visually-hidden">Trace step</label><input id="timeline" type="range" min="0" max="1" value="0" step="1"><div class="timeline-labels"><span id="timeline-position">Step 1</span><span id="timeline-total"></span></div></div>
+    <label class="speed-label" for="speed">Speed<select id="speed"><option value="1200">0.5×</option><option value="650" selected>1×</option><option value="325">2×</option><option value="160">4×</option></select></label>
+    <span class="keyboard-hint"><kbd>Space</kbd> play <kbd>←</kbd><kbd>→</kbd> step</span>
+  </footer>
+  <noscript><p class="noscript">Enable JavaScript to step through this browser-local simulation.</p></noscript>
+</body>
+</html>
