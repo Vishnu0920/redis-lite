@@ -171,6 +171,7 @@ std::string encodeCommand(const std::vector<std::string>& arguments) {//argument
 
 /*
 This decodes the RESP string of a command and converts it into an vector of arguments
+Parses only one command per call even if the input buffer contains multiple commands.
 */
 CommandResult parseCommand(std::string_view input) { //return type of this is the commandResult object
     Reader reader{input, 0, Status::Complete, {}}; //The reader object is initalised to parse the command
