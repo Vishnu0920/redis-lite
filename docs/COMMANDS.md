@@ -1,10 +1,10 @@
-# Available commands through Chapter 11
+# Available commands through Chapter 13
 
 The server implements a focused Redis-style command set over RESP2. Command names
 are case-insensitive. Keys, values, and sorted-set member names are binary-safe.
 All connections in one process share one in-memory database, in either server mode.
 Restarting the server starts with an empty database: no files, snapshots, or append
-log are written. Timers and TTL commands belong to later chapters.
+log are written. Optional key TTLs work for both value types in both server modes.
 
 Start a server and use the supplied client:
 
@@ -25,7 +25,7 @@ In another terminal:
 | --- | --- |
 | `PING [message]` | Returns `PONG`, or echoes the optional message. |
 | `ECHO message` | Returns the message as a bulk string. |
-| `SET key value` | Creates or replaces a string value. Returns `OK`. Replaces a sorted-set value too. |
+| `SET key value` | Creates or replaces a string value and clears its TTL. Returns `OK`. Replaces a sorted-set value too. |
 | `GET key` | Returns a string value, or null when absent. A sorted-set key produces `WRONGTYPE`. |
 | `DEL key [key ...]` | Deletes whole keys of either type. Returns the number actually removed; duplicates count once. |
 | `KEYS` or `KEYS *` | Returns all keys in bytewise lexical order. Only the `*` pattern is supported. |
@@ -33,6 +33,48 @@ In another terminal:
 `SET` supports only these three arguments; options such as `NX`, `XX`, and `EX`
 are not implemented. `KEYS` scans and sorts the whole keyspace, so it can take
 substantial time on a large database.
+
+## Key expiration
+
+| Command | Action and reply |
+| --- | --- |
+| `EXPIRE key seconds` | Sets or updates the timer. Returns integer `1` for an existing key, `0` for a missing key. Nonpositive seconds delete an existing key immediately. |
+| `TTL key` | Returns seconds remaining, rounded to the nearest second; `-1` means the key has no timer, `-2` means it is missing or expired. A live key with less than half a second left returns `0`. |
+| `PERSIST key` | Removes the timer without deleting the value. Returns `1` if a timer was removed, otherwise `0`. |
+
+New keys have no timer. `EXPIRE` accepts a signed 64-bit decimal integer;
+malformed values and positive durations that overflow the internal millisecond
+deadline are rejected without changing the existing timer. Conditional expiration
+options, `PEXPIRE`, and `PTTL` are not implemented.
+
+`SET` clears a TTL. Updating an existing sorted set with `ZADD` or `ZREM` preserves
+its TTL; deleting its last member deletes the key and timer together. `DEL`
+also removes the timer. Expired keys behave as missing for every command,
+including `KEYS`, even before the next scheduled expiration pass.
+
+The table describes the server's RESP integer replies. The supplied client uses
+the original command to display readable timer messages, in both interactive and
+one-command mode. `TTL -2` displays "Timer expired or key does not exist" because
+the client cannot distinguish those cases from the reply alone. `TTL 0` displays
+"Less than 1 second remaining". Errors keep their usual `(error)` display.
+
+```text
+SET session value     -> OK
+EXPIRE session 60     -> Timer set to 60 seconds.
+TTL session           -> Time remaining: 60 seconds. (if queried immediately)
+PERSIST session       -> Timer removed; this key has no expiration.
+TTL session           -> No timer for this key.
+DEL session           -> (integer) 1
+TTL session           -> Timer expired or key does not exist.
+```
+
+`EXPIRE` returning zero displays "Key does not exist or has expired; no timer was
+set". A successful nonpositive `EXPIRE` reports immediate key deletion. `PERSIST`
+returning zero displays "No timer to remove (key has no timer or does not exist)".
+
+Key TTLs are independent of connection activity. The event-loop runner also closes
+connections after 60 idle seconds by default. See [TIMERS.md](TIMERS.md) for the
+two timer structures, scheduling, and ownership.
 
 ## Sorted sets
 
@@ -98,6 +140,8 @@ also accepts one command per invocation, for example `./build/client GET greetin
 Requests remain nonempty RESP2 arrays of non-null bulk strings. Replies use simple
 strings, errors, integers, bulk strings, null bulk strings, and arrays. The client
 prints nulls as `(nil)`, integers as `(integer) N`, and arrays as numbered entries.
+Timer commands use the messages above instead of the generic integer display;
+their wire replies remain RESP integers.
 An empty string is different from null: `SET key ""` stores a real empty value.
 
 Request limits remain 128 elements including the command name, 64 KiB per bulk

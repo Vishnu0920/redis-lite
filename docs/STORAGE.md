@@ -1,7 +1,7 @@
 # Storage and commands without learning the internals
 
-The server now covers storage through Chapter 11: string values, a custom hash
-table, an augmented AVL tree, and sorted sets. You can trace commands through the
+The server now covers storage through Chapter 13: string values, a custom hash
+table, an augmented AVL tree, sorted sets, and optional key TTLs. You can trace commands through the
 public API without reading bucket migration or tree rotations.
 
 ## Read these layers in order
@@ -13,6 +13,7 @@ public API without reading bucket migration or tree rotations.
 | Custom storage adapter | [storage.cpp](../server/storage/storage.cpp) | A key holds a string or a sorted set; sorted sets use two indexes. |
 | Hash implementation, optional | [hash_table.h](../server/storage/data_structures/hash_table.h) | Buckets, collision chains, node ownership, and progressive rehashing. |
 | Tree implementation, optional | [avl_tree.h](../server/storage/data_structures/avl_tree.h) | Balancing, subtree counts, ordering, rank, and selection. |
+| TTL heap, optional | [min_heap.h](../server/storage/data_structures/min_heap.h) | Deadline ordering and maintaining each entry's heap index. |
 
 ```mermaid
 flowchart TD
@@ -20,6 +21,7 @@ flowchart TD
     Commands --> API[Storage interface]
     API --> Custom[CustomStorage: key lookup and value type]
     Custom --> Hash[Custom hash table: keys to entries]
+    Custom --> TTL[Indexed min-heap: optional key deadlines]
     Custom --> SetAPI[SortedSet interface]
     SetAPI --> ZSet[CustomSortedSet]
     ZSet --> Name[Custom hash table: member lookup]
@@ -44,6 +46,11 @@ bool removed = store->erase("greeting");
 | `set(key, value)` | Create or replace the value with a string. |
 | `erase(key)` | Delete a whole key; return whether it existed. |
 | `keys()` | Return a sorted snapshot of all keys. |
+| `expire(key, seconds)` | Set/update TTL, or delete immediately for nonpositive durations. |
+| `ttl(key)` | Return rounded seconds remaining, -1 for no TTL, -2 for missing. |
+| `persist(key)` | Remove a TTL and keep the value. |
+| `nextTTLDeadlineMS()` | Read the nearest monotonic deadline in O(1), or return no deadline. |
+| `processTTLExpirations(now, limit)` | Delete at most `limit` due keys; the default is 2,000 per pass. |
 | `zadd(key, members)` | Add/update `{member, score}` pairs; return the number newly added. |
 | `zrem(key, members)` | Remove members; return their count and delete the key if the set becomes empty. |
 | `zscore(key, member)` | Read a member's score. |
@@ -67,12 +74,19 @@ views, or STL iterators escape these interfaces.
 `main()` creates one storage backend and puts it in one `CommandProcessor`.
 All connections share that processor. The database therefore survives individual
 client disconnects and is visible across clients; it lasts for the server process.
-There is no persistence, snapshot loading, append log, TTL, or background expiration.
+There is no disk persistence, snapshot loading, or append log. Runners schedule
+TTL expiration; lookups also remove expired entries before using them.
 
 The top-level hash table owns each `Entry`. An entry has one key, a string value,
 and an optional owned sorted-set object. A null sorted-set pointer identifies a
 string entry; a non-null pointer identifies a sorted-set entry. We use ordinary
 C++ objects rather than manually constructing a tagged union.
+
+Each entry also has `heap_idx`, initially `NoHeapIndex`. A timed entry has exactly
+one node in the storage-owned min-heap. The heap borrows a typed pointer to the
+entry and updates `heap_idx` on every move. Hash migration never moves the entry.
+Every entry deletion removes its timer before destroying it; replacing a value
+with `SET` also removes its timer. See [TIMERS.md](TIMERS.md) for the full flow.
 
 Each sorted-set member owns its name and score once. The member hash table owns
 that object. The AVL tree links to the same object, providing a second index
@@ -84,7 +98,7 @@ value and all its members through RAII.
 
 **SET:** Validate the argument count. Copy the new value, look up the key, and
 insert an entry if absent. For an existing key, replace its string and destroy any
-previous sorted set. Return `+OK`.
+previous sorted set, and remove its TTL. Return `+OK`.
 
 **GET:** Look up the key through the hash table. If absent, return a null bulk
 string. If it holds a sorted set, return `WRONGTYPE`. Otherwise copy its string
@@ -147,8 +161,9 @@ to follow `ZRANK` or a large-offset `ZQUERY`.
 
 STL strings, vectors, and smart pointers handle byte storage, bucket allocations,
 and lifetime. They do not implement the associative lookup, rehash migration, tree
-balancing, or rank algorithms here. The collision chains are the linked-list
-structure needed through Chapter 11; timer lists and heaps are later work.
+balancing, or rank algorithms here. The collision chains, indexed min-heap, and
+embedded connection idle links are custom data structures too; vectors provide
+their underlying storage where needed.
 
 ## Swapping in STL later
 

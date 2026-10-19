@@ -4,6 +4,7 @@ import concurrent.futures
 import contextlib
 import os
 from pathlib import Path
+import re
 import socket
 import struct
 import subprocess
@@ -42,8 +43,14 @@ def receive_exact(sock, expected):
         offset += len(data)
 
 
+def read_server_log(log):
+    # Read without seeking the file description shared with the child: seeking
+    # while it logs could make its next write overwrite an earlier message.
+    return os.pread(log.fileno(), os.fstat(log.fileno()).st_size, 0).decode(errors="replace")
+
+
 @contextlib.contextmanager
-def running_server(mode, buffer=None, reverse_options=False):
+def running_server(mode, buffer=None, reverse_options=False, idle_timeout_ms=None, log_capture=None):
     # Refuse to test someone else's server on this fixed port.
     with socket.socket() as probe:
         try:
@@ -60,6 +67,8 @@ def running_server(mode, buffer=None, reverse_options=False):
                 args[1:1] = ["--buffer", buffer]
             else:
                 args += ["--buffer", buffer]
+        if idle_timeout_ms is not None:
+            args += ["--idle-timeout-ms", str(idle_timeout_ms)]
         process = subprocess.Popen(args, stdout=log, stderr=log)
         try:
             deadline = time.monotonic() + 5
@@ -67,21 +76,22 @@ def running_server(mode, buffer=None, reverse_options=False):
                 if process.poll() is not None:
                     raise RuntimeError("server exited during startup")
                 try:
-                    with connect():
+                    with connect() as probe:
+                        probe.sendall(command(b"PING"))
+                        receive_exact(probe, b"+PONG\r\n")
                         break
                 except ConnectionRefusedError:
                     if time.monotonic() >= deadline:
                         raise RuntimeError("server did not start")
                     time.sleep(0.02)
-            log.seek(0)
-            banner = log.readline().decode()
+            banner = read_server_log(log).splitlines()[0]
             if mode == "event-loop":
                 assert f"buffer={buffer or 'offset'}" in banner, banner
+                assert f"idle-timeout-ms={idle_timeout_ms or 60000}" in banner, banner
             yield process
             assert process.poll() is None, "server unexpectedly exited"
         except BaseException:
-            log.seek(0)
-            print(log.read().decode(errors="replace"))
+            print(read_server_log(log))
             raise
         finally:
             process.terminate()
@@ -90,6 +100,32 @@ def running_server(mode, buffer=None, reverse_options=False):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+            if log_capture is not None:
+                log_capture.append(read_server_log(log))
+
+
+def check_connection_logs(log, expected_reasons):
+    # A reused fd must finish its old lifecycle before its next acceptance.
+    active = set()
+    reasons = set()
+    accepted_count = 0
+    for line in log.splitlines():
+        accepted = re.fullmatch(r"Connection accepted \(fd=(\d+)\)", line)
+        closed = re.fullmatch(r"Connection closing \(fd=(\d+)\): (.+)", line)
+        if accepted:
+            fd = int(accepted[1])
+            assert fd not in active, f"duplicate acceptance without closure: {line}"
+            active.add(fd)
+            accepted_count += 1
+        elif closed:
+            fd = int(closed[1])
+            assert fd in active, f"closure without acceptance: {line}"
+            active.remove(fd)
+            reasons.add(closed[2])
+    assert accepted_count > 0, "no connection acceptance logs"
+    assert set(expected_reasons) <= reasons, reasons
+    # SIGTERM ends the test server without a graceful drain, so clients still
+    # alive at termination need not have a closure message.
 
 
 def check_commands():
@@ -188,6 +224,161 @@ def check_fragmentation_and_pipeline():
         receive_exact(sock, b"+PONG\r\n")
         sock.sendall(b"\r\n")
         receive_exact(sock, bulk(b"next"))
+
+
+def check_ttl_commands():
+    with connect() as sock, connect() as other:
+        exchanges = [
+            ((b"TTL", b"missing"), b":-2\r\n"),
+            ((b"EXPIRE", b"missing", b"1"), b":0\r\n"),
+            ((b"PERSIST", b"missing"), b":0\r\n"),
+            ((b"SET", b"expires", b"value"), b"+OK\r\n"),
+            ((b"TTL", b"expires"), b":-1\r\n"),
+            ((b"expire", b"expires", b"1"), b":1\r\n"),
+            ((b"EXPIRE", b"expires", b"30"), b":1\r\n"),
+            ((b"EXPIRE", b"expires", b"1"), b":1\r\n"),
+            ((b"EXPIRE", b"expires", b"1.5"), b"-ERR value is not an integer or out of range\r\n"),
+            ((b"EXPIRE", b"expires", b"9223372036854775807"), b"-ERR invalid expire time\r\n"),
+            ((b"SET", b"persists", b"value"), b"+OK\r\n"),
+            ((b"EXPIRE", b"persists", b"1"), b":1\r\n"),
+            ((b"persist", b"persists"), b":1\r\n"),
+            ((b"PERSIST", b"persists"), b":0\r\n"),
+            ((b"SET", b"replaced", b"old"), b"+OK\r\n"),
+            ((b"EXPIRE", b"replaced", b"1"), b":1\r\n"),
+            ((b"SET", b"replaced", b"new"), b"+OK\r\n"),
+            ((b"ZADD", b"ttl-board", b"1", b"alice"), b":1\r\n"),
+            ((b"EXPIRE", b"ttl-board", b"1"), b":1\r\n"),
+            ((b"ZADD", b"ttl-board", b"2", b"bob"), b":1\r\n"),
+            ((b"SET", b"zero", b"value"), b"+OK\r\n"),
+            ((b"EXPIRE", b"zero", b"0"), b":1\r\n"),
+            ((b"TTL", b"zero"), b":-2\r\n"),
+            ((b"SET", b"negative", b"value"), b"+OK\r\n"),
+            ((b"EXPIRE", b"negative", b"-1"), b":1\r\n"),
+            ((b"GET", b"negative"), b"$-1\r\n"),
+        ]
+        sock.sendall(b"".join(command(*args) for args, _ in exchanges))
+        receive_exact(sock, b"".join(reply for _, reply in exchanges))
+        # No requests arrive while these timers expire. Both runners must still
+        # preserve permanent keys and avoid exposing expired strings/sets.
+        time.sleep(1.2)
+        exchanges = [
+            ((b"GET", b"expires"), b"$-1\r\n"),
+            ((b"TTL", b"expires"), b":-2\r\n"),
+            ((b"PERSIST", b"expires"), b":0\r\n"),
+            ((b"GET", b"persists"), bulk(b"value")),
+            ((b"TTL", b"persists"), b":-1\r\n"),
+            ((b"GET", b"replaced"), bulk(b"new")),
+            ((b"TTL", b"replaced"), b":-1\r\n"),
+            ((b"ZCARD", b"ttl-board"), b":0\r\n"),
+            ((b"KEYS",), array(b"persists", b"replaced")),
+            ((b"DEL", b"persists", b"replaced", b"ttl-board"), b":2\r\n"),
+        ]
+        other.sendall(b"".join(command(*args) for args, _ in exchanges))
+        receive_exact(other, b"".join(reply for _, reply in exchanges))
+
+
+def check_client_timer_messages():
+    result = subprocess.run(
+        [str(CLIENT)],
+        input=('SET cli-timer value\nttl cli-timer\nexpire cli-timer 30\nTTL cli-timer\n'
+               'persist cli-timer\nPERSIST cli-timer\nEXPIRE cli-timer invalid\n'
+               'GET cli-timer\nDEL cli-timer\nTTL cli-timer\n'
+               'EXPIRE cli-timer 30\nPERSIST cli-timer\nexit\n'),
+        capture_output=True, text=True, timeout=5, check=True)
+    assert not result.stderr, result.stderr
+    assert "EXPIRE, TTL, PERSIST" in result.stdout
+    assert "No timer for this key." in result.stdout
+    assert "Timer set to 30 seconds." in result.stdout
+    assert re.search(r"Time remaining: (29|30) seconds\.", result.stdout), result.stdout
+    assert "Timer removed; this key has no expiration." in result.stdout
+    assert "No timer to remove (key has no timer or does not exist)." in result.stdout
+    assert "Timer expired or key does not exist." in result.stdout
+    assert "Key does not exist or has expired; no timer was set." in result.stdout
+    assert "(error) ERR value is not an integer or out of range" in result.stdout
+    assert "(integer) 1" in result.stdout  # DEL keeps its normal integer display.
+
+    # One-command invocations use the same presentation as interactive queries.
+    for args, expected in (
+        (["TTL", "cli-timer"], "Timer expired or key does not exist.\n"),
+        (["EXPIRE", "cli-timer", "30"], "Key does not exist or has expired; no timer was set.\n"),
+        (["PERSIST", "cli-timer"], "No timer to remove (key has no timer or does not exist).\n"),
+    ):
+        result = subprocess.run([str(CLIENT), *args], capture_output=True,
+                                text=True, timeout=5, check=True)
+        assert result.stdout == expected, result.stdout
+    with connect() as sock:
+        sock.sendall(command(b"SET", b"cli-timer", b"value"))
+        receive_exact(sock, b"+OK\r\n")
+    result = subprocess.run([str(CLIENT), "EXPIRE", "cli-timer", "0"],
+                            capture_output=True, text=True, timeout=5, check=True)
+    assert result.stdout == "Key deleted immediately (nonpositive TTL).\n"
+    with connect() as sock:
+        sock.sendall(command(b"GET", b"cli-timer"))
+        receive_exact(sock, b"$-1\r\n")
+
+
+def check_idle_timers():
+    # The test server uses an 800 ms uniform timeout. Read activity counts even
+    # before a complete command exists; ordinary PING replies count as writes.
+    with connect() as idle, connect() as active, connect() as partial:
+        partial.sendall(b"*2\r\n$4\r\nECHO\r\n$12\r\n")
+        for _ in range(8):
+            time.sleep(0.15)
+            active.sendall(command(b"PING"))
+            receive_exact(active, b"+PONG\r\n")
+            partial.sendall(b"x")
+        idle.settimeout(2)
+        assert idle.recv(1) == b"", "inactive connection was not closed"
+        partial.sendall(b"xxxx\r\n")
+        receive_exact(partial, bulk(b"x" * 12))
+        active.sendall(command(b"PING"))
+        receive_exact(active, b"+PONG\r\n")
+    # No other client traffic can wake poll: its deadline must do that itself.
+    with connect() as idle:
+        idle.settimeout(3)
+        start = time.monotonic()
+        assert idle.recv(1) == b"", "idle timer did not wake poll"
+        assert time.monotonic() - start >= 0.6, "connection timed out too early"
+    # A new connection may reuse an expired descriptor; old list links must be gone.
+    for _ in range(20):
+        with connect() as sock:
+            sock.sendall(command(b"PING"))
+            receive_exact(sock, b"+PONG\r\n")
+
+    # Fill the output path while the peer never reads. EAGAIN and readiness
+    # alone must not keep this connection alive indefinitely.
+    with connect() as slow, connect() as active:
+        slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        slow.settimeout(4)
+        finished = threading.Event()
+        errors = []
+
+        def fill_output():
+            try:
+                frame = command(b"ECHO", b"x" * 65536)
+                for _ in range(1024):
+                    slow.sendall(frame)
+            except OSError as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        sender = threading.Thread(target=fill_output, daemon=True)
+        sender.start()
+        try:
+            for _ in range(30):
+                if finished.wait(0.1):
+                    break
+                active.sendall(command(b"PING"))
+                receive_exact(active, b"+PONG\r\n")
+            assert finished.is_set(), "stalled output connection did not time out"
+            assert errors and isinstance(errors[0], (ConnectionResetError, BrokenPipeError)), errors
+            active.sendall(command(b"PING"))
+            receive_exact(active, b"+PONG\r\n")
+        finally:
+            slow.close()
+            sender.join(timeout=5)
+        assert not sender.is_alive(), "stalled writer test did not finish"
 
 
 def check_protocol_errors():
@@ -294,6 +485,7 @@ def main():
     result = subprocess.run([str(SERVER), "--help"], capture_output=True, text=True, check=True)
     assert "threaded|event-loop" in result.stdout
     assert "regular|offset" in result.stdout
+    assert "--idle-timeout-ms" in result.stdout and "60000" in result.stdout
     for args in (
         ["--mode", "invalid"],
         ["--mode", "event-loop", "--buffer", "invalid"],
@@ -303,6 +495,14 @@ def main():
         ["--mode", "event-loop", "--mode", "threaded"],
         ["--mode", "event-loop", "--buffer", "offset", "--buffer", "regular"],
         ["--unknown", "value"],
+        ["--idle-timeout-ms", "100"],
+        ["--mode", "threaded", "--idle-timeout-ms", "100"],
+        ["--mode", "event-loop", "--idle-timeout-ms", "0"],
+        ["--mode", "event-loop", "--idle-timeout-ms", "-1"],
+        ["--mode", "event-loop", "--idle-timeout-ms", "abc"],
+        ["--mode", "event-loop", "--idle-timeout-ms", "2147483648"],
+        ["--mode", "event-loop", "--idle-timeout-ms", "100", "--idle-timeout-ms", "200"],
+        ["--mode", "event-loop", "--idle-timeout-ms"],
     ):
         result = subprocess.run([str(SERVER), *args], capture_output=True, timeout=5)
         assert result.returncode != 0, args
@@ -312,16 +512,27 @@ def main():
         check_commands()
     for mode, buffer in (("threaded", None), ("event-loop", None),
                          ("event-loop", "regular"), ("event-loop", "offset")):
-        with running_server(mode, buffer) as process:
+        logs = []
+        with running_server(mode, buffer, log_capture=logs) as process:
             check_commands()
             check_storage()
+            check_ttl_commands()
+            check_client_timer_messages()
             check_fragmentation_and_pipeline()
             check_protocol_errors()
             check_half_close_and_limits()
             check_multiple_clients(process, mode)
             check_slow_reader()
             check_disconnects()
+        check_connection_logs(logs[0], {"client disconnected", "protocol error",
+                                       "client disconnected during incomplete request"})
         print(f"Integration tests passed ({mode}, buffer={buffer or 'default'})")
+    for buffer in ("regular", "offset"):
+        logs = []
+        with running_server("event-loop", buffer, idle_timeout_ms=800, log_capture=logs):
+            check_idle_timers()
+        check_connection_logs(logs[0], {"idle timeout", "client disconnected"})
+        print(f"Idle timer integration tests passed (buffer={buffer})")
 
 
 if __name__ == "__main__":

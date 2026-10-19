@@ -1,13 +1,13 @@
 # Redis Lite
 
 A Redis-style server and command-line client built in C++17, following
-*Build Your Own Redis* through Chapter 11. It uses RESP2 for communication and
+*Build Your Own Redis* through Chapter 13. It uses RESP2 for communication and
 custom hash tables and an augmented AVL tree for strings and sorted sets.
 
 The project offers two ways to handle client connections and two event-loop
 input buffers, making it useful for learning and later performance comparisons.
 All clients share one database. **Data is stored only in memory and is lost when
-the server stops.** Persistence and TTLs are not implemented.
+the server stops.** Keys can have optional TTLs; disk persistence is not implemented.
 
 ## Build
 
@@ -28,7 +28,8 @@ server/
   commands/                Command validation and execution
   buffers/                 Regular and offset input buffers
   storage/                 Storage interfaces and custom backend
-    data_structures/       Hash table and AVL tree
+    data_structures/       Hash table, AVL tree, and indexed min-heap
+  timers/                  Monotonic time helpers and intrusive idle list
   runners/                 Threaded and event-loop connection handling
 common/                    Shared RESP2 protocol and socket helpers
 client/                    Command-line client
@@ -62,9 +63,28 @@ Defaults:
 the original `std::string` behavior; the offset buffer is the alternative FIFO
 implementation. Both modes provide the same commands and storage backend.
 
+Event-loop connections close after **60 seconds without successful reads or
+writes**. Partial requests count as activity. Threaded connections retain their
+original blocking behavior without an idle timeout. For a different uniform
+event-loop timeout, use `--idle-timeout-ms N`, for example:
+
+```bash
+./build/server --mode event-loop --idle-timeout-ms 60000
+```
+
 The server listens on **127.0.0.1:6379**. Stop it with **Ctrl+C** before switching
 configurations; no rebuild is needed. Restarting also clears the database.
 Use `./build/server --help` to see the options.
+
+Server logs identify accepted connections and their closure reasons by fd:
+
+```text
+Connection accepted (fd=7)
+Connection closing (fd=7): idle timeout
+```
+
+Both modes log client disconnects, incomplete requests, protocol errors, and socket
+failures. Event-loop mode also logs idle timeouts.
 
 ## Connect and run commands
 
@@ -96,7 +116,13 @@ Double quotes group arguments containing spaces or represent an empty string.
 ```
 
 Available commands: `PING`, `ECHO`, `SET`, `GET`, `DEL`, `KEYS`, `ZADD`, `ZREM`,
-`ZSCORE`, `ZRANK`, `ZCARD`, and `ZQUERY`. This is a focused subset; `ZQUERY` is the
+`ZSCORE`, `ZRANK`, `ZCARD`, `ZQUERY`, `EXPIRE`, `TTL`, and `PERSIST`.
+`EXPIRE key seconds` sets or replaces a key's timer; `TTL key` reports seconds
+remaining (`-1` for no timer, `-2` for a missing key); `PERSIST key` removes the timer.
+These work for strings and sorted sets in both server modes. New keys have no TTL.
+The client displays timer results as readable messages, such as "No timer for this
+key" or "Timer removed; this key has no expiration". Wire replies remain RESP2.
+This is a focused subset; `ZQUERY` is the
 book's simplified range command. See [COMMANDS.md](docs/COMMANDS.md) for syntax,
 replies, examples, and limits.
 
@@ -129,5 +155,6 @@ See [visualization and publishing instructions](docs/VISUALIZER.md).
 - [Project details](docs/PROJECT_DETAILS.md): implementation walkthrough and chapter progression.
 - [Architecture](docs/ARCHITECTURE.md): connection handling and ownership.
 - [Storage](docs/STORAGE.md): simple interfaces, command flow, and future STL replacement.
+- [Timers](docs/TIMERS.md): TTL heap, idle list, ownership, and poll deadlines.
 - [Buffer handling](docs/BUFFER_HANDLING.md): regular versus offset buffering.
 - [Performance comparison plan](docs/PERFORMANCE.md): workloads and measurement criteria.

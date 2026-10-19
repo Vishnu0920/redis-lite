@@ -3,9 +3,11 @@
 #include "commands/commands.h"
 
 #include <arpa/inet.h>
+#include <charconv>
 #include <cstdio>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <string_view>
 
 int main(int argc, char* argv[]) {
@@ -13,10 +15,13 @@ int main(int argc, char* argv[]) {
     InputBufferMode bufferMode = InputBufferMode::Offset;
     bool modeSpecified = false;
     bool bufferSpecified = false;
+    bool idleTimeoutSpecified = false;
+    std::uint64_t idleTimeoutMS = timers::DefaultIdleTimeoutMS;
     auto usage = [&](std::ostream& output) {
         output << "Usage: " << argv[0]
-               << " [--mode threaded|event-loop] [--buffer regular|offset]\n"
-               << "--buffer requires --mode event-loop (default buffer: offset).\n";
+               << " [--mode threaded|event-loop] [--buffer regular|offset] [--idle-timeout-ms N]\n"
+               << "--buffer requires --mode event-loop (default buffer: offset).\n"
+               << "--idle-timeout-ms requires --mode event-loop (default: 60000; positive integer <= INT_MAX).\n";
     };
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         usage(std::cout);
@@ -37,6 +42,14 @@ int main(int argc, char* argv[]) {
                    (value == "regular" || value == "offset")) {
             bufferMode = value == "regular" ? InputBufferMode::Regular : InputBufferMode::Offset;
             bufferSpecified = true;
+        } else if (option == "--idle-timeout-ms" && !idleTimeoutSpecified) {
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), idleTimeoutMS);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                idleTimeoutMS == 0 || idleTimeoutMS > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+                usage(std::cerr);
+                return 1;
+            }
+            idleTimeoutSpecified = true;
         } else {
             usage(std::cerr);
             return 1;
@@ -44,6 +57,11 @@ int main(int argc, char* argv[]) {
     }
     if (bufferSpecified && !eventLoop) {
         std::cerr << "--buffer requires --mode event-loop.\n";
+        usage(std::cerr);
+        return 1;
+    }
+    if (idleTimeoutSpecified && !eventLoop) {
+        std::cerr << "--idle-timeout-ms requires --mode event-loop.\n";
         usage(std::cerr);
         return 1;
     }
@@ -88,11 +106,12 @@ int main(int argc, char* argv[]) {
               << " (" << (eventLoop ? "event-loop" : "threaded");
     if (eventLoop) {
         std::cout << ", buffer=" << (bufferMode == InputBufferMode::Regular ? "regular" : "offset");
+        std::cout << ", idle-timeout-ms=" << idleTimeoutMS;
     }
     std::cout << ")" << std::endl;
     try {
         auto commands = std::make_shared<CommandProcessor>(storage::makeCustomStorage());
-        return eventLoop ? runEventLoopServer(listener.get(), commands, bufferMode)
+        return eventLoop ? runEventLoopServer(listener.get(), commands, bufferMode, idleTimeoutMS)
                          : runThreadedServer(listener.get(), commands);
     } catch (const std::exception& e) {
         std::cerr << "Server failed: " << e.what() << '\n';

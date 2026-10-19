@@ -1,8 +1,10 @@
-# Project details — Chapters 4–11: RESP2, storage, and sorted sets
+# Project details — Chapters 4–13: RESP2, storage, sorted sets, and timers
 
 Linux / WSL, C++17. This is a learning project with a focused RESP2 subset.
 It implements PING/ECHO, GET/SET/DEL/KEYS, and sorted-set commands using a custom
-hash table and augmented AVL tree. Data lives only in memory and is lost on restart.
+hash table and augmented AVL tree. Optional key TTLs use an indexed min-heap;
+event-loop idle timeouts use embedded doubly linked nodes.
+Data lives only in memory and is lost on restart.
 See [COMMANDS.md](COMMANDS.md) for syntax and [STORAGE.md](STORAGE.md) for the simple
 storage interfaces and command flow.
 
@@ -128,8 +130,9 @@ Both modes share the parser, command executor, listener setup, and wire behavior
 All clients share one database through `CommandProcessor`. Storage commands hold
 a mutex for their operation and reply snapshot, releasing it before socket I/O;
 PING/ECHO bypass storage. Both server modes use this same command layer.
-There is no connection cap, idle timeout, or graceful shutdown/drain mechanism;
-the listener is bound to loopback for local learning.
+There is no connection cap or graceful shutdown/drain mechanism. Event-loop
+connections have a 60-second idle timeout; threaded connections retain their
+previous lifetime. The listener is bound to loopback for local learning.
 
 ## Event-loop mode (Chapters 5–6)
 
@@ -145,7 +148,9 @@ socket with RAII. Unused slots are empty. Instead of independent `want_read` and
 | End | Removed before the next poll | Destroy Conn and close its socket. |
 
 The loop rebuilds `pollfds` with the listener first and live connections afterward,
-then calls `poll(..., -1)` to sleep until a socket is ready. The listening socket
+then calls `poll(..., nextTimerMS())` to sleep until a socket is ready or the
+nearest idle/TTL timer is due. Finding that deadline reads only the idle-list front
+and TTL heap root. The listening socket
 and every accepted client socket have O_NONBLOCK enabled. The accept handler takes
 available connections until EAGAIN or a 64-connection turn limit, allowing existing
 clients to make progress during a connection burst.
@@ -171,7 +176,7 @@ watch only POLLIN, avoiding continuous wakeups on writable sockets. `sendAll` st
 exclusive to the blocking client and threaded server.
 
 The poll list and fd-indexed vector are scanned each iteration. This is the book's
-learning stage; epoll, resumable parsing, timers, and background
+learning stage; epoll, resumable parsing, and background
 workers remain future work. Command execution itself runs on the event-loop thread,
 so large listings, queries, and deletions can delay other clients.
 
@@ -189,7 +194,8 @@ This adapts the supplied book's progression:
 - Chapter 8 (complete): custom hash table and incremental rehashing.
 - Chapter 9 (complete): RESP2 null, integer, and array replies instead of custom serialization.
 - Chapters 10–11 (complete): augmented AVL tree and sorted sets, including rank queries.
-- Chapters 12–13: idle timers, a min-heap, and key expiration.
+- Chapters 12–13 (complete): embedded idle timers, an indexed min-heap, key expiration,
+  and EXPIRE/TTL/PERSIST commands in seconds. See [TIMERS.md](TIMERS.md).
 - Chapter 14: selected background work using a thread pool.
 
 Start by tracing encodeCommand({"ECHO", "hello"}), then Reader::readBulk(),
@@ -197,4 +203,5 @@ parseCommand(), handleClient(), and query(). For the new stage, follow Conn,
 prepareResponse(), handleRead(), handleWrite(), and runEventLoopServer().
 For storage, trace `CommandProcessor::execute()` into `storage::Storage` and then
 the adapter in `storage.cpp`. See [STORAGE.md](STORAGE.md) before reading low-level
-nodes and rotations. Timers and TTL are the next book chapters and are not implemented.
+nodes and rotations. For timers, trace `nextTimerMS()`, `refreshTimer()`, and
+`processTimers()`, then `Storage::expire()` and the indexed heap.

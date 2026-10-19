@@ -1,6 +1,9 @@
 #include "runners/runners.h"
+#include "runners/connection_log.h"
 #include "commands/commands.h"
 #include "buffers/input_buffer.h"
+#include "timers/idle_list.h"
+#include "timers/time.h"
 #include "net.h"
 #include "resp.h"
 
@@ -19,7 +22,8 @@ enum class State { Request, Response, End };
 
 template <typename Buffer>
 struct Conn {
-    Conn(net::Socket socket, CommandProcessor& commands) : socket(std::move(socket)), commands(commands) {}
+    Conn(net::Socket socket, CommandProcessor& commands)
+        : socket(std::move(socket)), commands(commands), closeLog(this->socket.get()) {}
 
     net::Socket socket;
     CommandProcessor& commands;
@@ -28,6 +32,9 @@ struct Conn {
     std::string output;  // One reply at a time: slow readers cannot grow a reply queue.
     std::size_t sent = 0;
     bool closeAfterWrite = false;
+    structures::ListNode<Conn<Buffer>> idle_node;
+    std::uint64_t last_active_ms = 0;
+    connection_log::CloseLog closeLog;
 };
 
 // Like the sample's fd2Conn: index by fd, with empty slots for unused descriptors.
@@ -35,6 +42,57 @@ template <typename Buffer>
 using Connections = std::vector<std::unique_ptr<Conn<Buffer>>>;
 constexpr std::size_t IoBudget = 64 * 1024; // Bytes per read/write handler turn.
 constexpr unsigned AcceptBudget = 64;      //Per turn at max we will accpet 64 connections/call handleConnections() 64 times(we dont want to spend all the time just accepting new connections)
+
+// Runner-lifetime state: connections own sockets; the idle list borrows them.
+// The shared processor owns the database and its TTL heap.
+template <typename Buffer>
+struct EventLoopState {
+    CommandProcessor& commands;
+    std::uint64_t idleTimeoutMS;
+    Connections<Buffer> fd2Conn;
+    structures::IntrusiveList<Conn<Buffer>, &Conn<Buffer>::idle_node> idleList;
+};
+
+template <typename Buffer>
+void refreshTimer(EventLoopState<Buffer>& state, Conn<Buffer>& conn) {
+    conn.last_active_ms = timers::monotonicMS();
+    state.idleList.moveToBack(conn);
+}
+
+template <typename Buffer>
+void destroyConnection(EventLoopState<Buffer>& state, Conn<Buffer>& conn) {
+    const int fd = conn.socket.get();
+    state.idleList.erase(conn); // Unlink before the Conn (and its node) dies.
+    state.fd2Conn[fd].reset(); // Socket's destructor closes the descriptor.
+}
+
+template <typename Buffer>
+int nextTimerMS(EventLoopState<Buffer>& state) {
+    auto deadline = state.commands.nextTTLDeadlineMS(); // Heap root: O(1).
+    if (const auto* conn = state.idleList.front()) {
+        const auto idleDeadline = conn->last_active_ms + state.idleTimeoutMS;
+        if (!deadline || idleDeadline < *deadline) deadline = idleDeadline;
+    }
+    return timers::pollTimeoutMS(deadline, timers::monotonicMS());
+}
+
+template <typename Buffer>
+void processIdleTimeouts(EventLoopState<Buffer>& state, std::uint64_t now) {
+    while (auto* conn = state.idleList.front()) {
+        if (conn->last_active_ms + state.idleTimeoutMS > now) break;
+        conn->closeLog.reason = "idle timeout";
+        destroyConnection(state, *conn);
+    }
+}
+
+template <typename Buffer>
+void processTimers(EventLoopState<Buffer>& state) {
+    const auto now = timers::monotonicMS();
+    processIdleTimeouts(state, now);
+    // Bound TTL deletions per turn. If more are due, nextTimerMS returns zero
+    // and poll checks I/O readiness before the next expiration batch.
+    state.commands.processTTLExpirations(now);
+}
 
 bool setNonBlocking(int fd) {
     const int flags = ::fcntl(fd, F_GETFL, 0);
@@ -71,7 +129,7 @@ bool prepareResponse(Conn<Buffer>& conn) {
 }
 
 template <typename Buffer>
-void handleRead(Conn<Buffer>& conn) {
+void handleRead(Conn<Buffer>& conn, bool& activity) {
     std::size_t received = 0;
     while (conn.state == State::Request) {
         // Parse before recv, including after the last read of this turn. Thus a
@@ -83,6 +141,7 @@ void handleRead(Conn<Buffer>& conn) {
         const std::size_t count = std::min(sizeof(buffer), IoBudget - received);
         const ssize_t n = ::recv(conn.socket.get(), buffer, count, 0);
         if (n > 0) {
+            activity = true;
             conn.input.append(buffer, static_cast<std::size_t>(n));
             received += static_cast<std::size_t>(n);
             continue;
@@ -90,7 +149,9 @@ void handleRead(Conn<Buffer>& conn) {
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && wouldBlock()) return; // this case is when the kernel input buffer is emtpy-->Retain input and wait for POLLIN.
         if (n < 0) std::perror("recv");
+        conn.closeLog.reason = n < 0 ? "receive error" : "client disconnected";
         if (n == 0 && !conn.input.empty()) {
+            conn.closeLog.reason = "client disconnected during incomplete request";
             std::cerr << "Client closed during a command\n";
         }
         conn.state = State::End;
@@ -98,13 +159,14 @@ void handleRead(Conn<Buffer>& conn) {
 }
 
 template <typename Buffer>
-void handleWrite(Conn<Buffer>& conn) {
+void handleWrite(Conn<Buffer>& conn, bool& activity) {
     std::size_t written = 0;
     while (conn.sent < conn.output.size() && written < IoBudget) {
         const std::size_t count = std::min(conn.output.size() - conn.sent, IoBudget - written);
         const ssize_t n = ::send(conn.socket.get(), conn.output.data() + conn.sent, count, MSG_NOSIGNAL);
 
         if (n > 0) {
+            activity = true;
             conn.sent += static_cast<std::size_t>(n);
             written += static_cast<std::size_t>(n);
             continue;
@@ -122,6 +184,7 @@ void handleWrite(Conn<Buffer>& conn) {
 
 
         if (n < 0) std::perror("send");
+        conn.closeLog.reason = n < 0 ? "send error" : "send returned zero";
         conn.state = State::End;
         return;
     }
@@ -129,6 +192,7 @@ void handleWrite(Conn<Buffer>& conn) {
 
     conn.output.clear();
     conn.sent = 0;
+    if (conn.closeAfterWrite) conn.closeLog.reason = "protocol error";
     conn.state = conn.closeAfterWrite ? State::End : State::Request;
     if (conn.state == State::Request) {
         // A pipeline may already contain the next complete command. Queue its
@@ -138,7 +202,8 @@ void handleWrite(Conn<Buffer>& conn) {
 }
 
 template <typename Buffer>
-bool handleNewConnections(int listener, Connections<Buffer>& fd2Conn, CommandProcessor& commands) {
+bool handleNewConnections(int listener, EventLoopState<Buffer>& state) {
+    auto& fd2Conn = state.fd2Conn;
     for (unsigned accepted = 0; accepted < AcceptBudget;) {
         net::Socket socket(::accept(listener, nullptr, nullptr));
         const int fd = socket.get();
@@ -155,6 +220,8 @@ bool handleNewConnections(int listener, Connections<Buffer>& fd2Conn, CommandPro
             return false;
         }
         ++accepted;
+        connection_log::accepted(fd);
+        connection_log::CloseLog setupLog(fd, "connection setup failed");
         if (!setNonBlocking(fd)) {
             std::perror("fcntl client");
             continue; // Socket closes automatically.
@@ -162,18 +229,22 @@ bool handleNewConnections(int listener, Connections<Buffer>& fd2Conn, CommandPro
         if (fd2Conn.size() <= static_cast<std::size_t>(fd)) {
             fd2Conn.resize(static_cast<std::size_t>(fd) + 1);
         }
-        fd2Conn[fd] = std::make_unique<Conn<Buffer>>(std::move(socket), commands);
+        fd2Conn[fd] = std::make_unique<Conn<Buffer>>(std::move(socket), state.commands);
+        setupLog.release(); // Conn now logs its own closure.
+        fd2Conn[fd]->last_active_ms = timers::monotonicMS();
+        state.idleList.pushBack(*fd2Conn[fd]);
     }
     return true;
 }
 template <typename Buffer>
-int runEventLoop(int listener, CommandProcessor& commands) {
+int runEventLoop(int listener, CommandProcessor& commands, std::uint64_t idleTimeoutMS) {
     if (!setNonBlocking(listener)) {
         std::perror("fcntl listener");
         return 1;
     }
 
-    Connections<Buffer> fd2Conn;
+    EventLoopState<Buffer> state{commands, idleTimeoutMS, {}, {}};
+    auto& fd2Conn = state.fd2Conn;
     std::vector<pollfd> pollfds;
     while (true) {
         pollfds.clear();
@@ -186,8 +257,11 @@ int runEventLoop(int listener, CommandProcessor& commands) {
             pollfds.push_back({conn->socket.get(), events, 0});
         }
 
-        if (::poll(pollfds.data(), pollfds.size(), -1) < 0) {
-            if (errno == EINTR) continue;
+        if (::poll(pollfds.data(), pollfds.size(), nextTimerMS(state)) < 0) {
+            if (errno == EINTR) {
+                processTimers(state);
+                continue;
+            }
             std::perror("poll");
             return 1;
         }
@@ -197,7 +271,7 @@ int runEventLoop(int listener, CommandProcessor& commands) {
             return 1;
         }
         if ((pollfds[0].revents & POLLIN) &&
-            !handleNewConnections<Buffer>(listener, fd2Conn, commands)) return 1;
+            !handleNewConnections(listener, state)) return 1;
 
         // The snapshot contains only clients present before poll; new clients
         // enter the next snapshot. Heap-owned Conn objects survive vector growth.
@@ -205,8 +279,10 @@ int runEventLoop(int listener, CommandProcessor& commands) {
             const auto& pfd = pollfds[i];
             if (!pfd.revents) continue;
             auto& conn = *fd2Conn[pfd.fd];
+            bool activity = false;
             try {
                 if (pfd.revents & (POLLERR | POLLNVAL)) {
+                    conn.closeLog.reason = pfd.revents & POLLNVAL ? "invalid descriptor" : "socket error";
                     conn.state = State::End;
                 }
 
@@ -214,9 +290,9 @@ int runEventLoop(int listener, CommandProcessor& commands) {
                     // HUP can accompany unread data; recv must drain it before
                     // observing EOF. A write-side half-close still gets replies.
                     if (conn.state == State::Request &&
-                        (pfd.revents & (POLLIN | POLLHUP))) handleRead(conn);
+                        (pfd.revents & (POLLIN | POLLHUP))) handleRead(conn, activity);
                     if (conn.state == State::Response &&
-                        (pfd.revents & (POLLIN | POLLOUT | POLLHUP))) handleWrite(conn); //if any 3 of these events are truen it will execute
+                        (pfd.revents & (POLLIN | POLLOUT | POLLHUP))) handleWrite(conn, activity); //if any 3 of these events are truen it will execute
 
                     /*
                     We have implemented optimistic non blocking write here. First we check whether a connection is in request state then we check
@@ -227,19 +303,23 @@ int runEventLoop(int listener, CommandProcessor& commands) {
                 }
             }
             catch (const std::exception& e) {
-                std::cerr << "Client handler failed: " << e.what() << '\n';
+                std::fprintf(stderr, "Client handler failed (fd=%d): %s\n", pfd.fd, e.what());
+                conn.closeLog.reason = "handler exception";
                 conn.state = State::End;
             }
-            if (conn.state == State::End) fd2Conn[pfd.fd].reset();
+            if (conn.state == State::End) destroyConnection(state, conn);
+            else if (activity) refreshTimer(state, conn);
         }
+        processTimers(state);
     }
 }
 } // namespace
 
-int runEventLoopServer(int listener, std::shared_ptr<CommandProcessor> commands, InputBufferMode bufferMode) {
+int runEventLoopServer(int listener, std::shared_ptr<CommandProcessor> commands,
+                       InputBufferMode bufferMode, std::uint64_t idleTimeoutMS) {
     // Select once at startup; buffer operations have no runtime mode branch.
     if (bufferMode == InputBufferMode::Regular) {
-        return runEventLoop<RegularInputBuffer>(listener, *commands);
+        return runEventLoop<RegularInputBuffer>(listener, *commands, idleTimeoutMS);
     }
-    return runEventLoop<InputBuffer>(listener, *commands);
+    return runEventLoop<InputBuffer>(listener, *commands, idleTimeoutMS);
 }

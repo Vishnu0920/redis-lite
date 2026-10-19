@@ -29,7 +29,7 @@ storage backend, then dispatches to exactly one runner:
 
 ```cpp
 auto commands = std::make_shared<CommandProcessor>(storage::makeCustomStorage());
-return eventLoop ? runEventLoopServer(listener.get(), commands, bufferMode)
+return eventLoop ? runEventLoopServer(listener.get(), commands, bufferMode, idleTimeoutMS)
                  : runThreadedServer(listener.get(), commands);
 ```
 
@@ -40,7 +40,7 @@ flowchart TD
     Listener --> Mode{Selected mode}
     Mode -->|default or threaded| Threaded[runThreadedServer]
     Mode -->|event-loop| EventLoop[runEventLoopServer]
-    Threaded --> Accept[Blocking accept and a worker thread per client]
+    Threaded --> Accept[Poll listener and TTLs, accept, start a worker per client]
     EventLoop --> Poll[Nonblocking accept and one poll loop for all clients]
 ```
 
@@ -62,7 +62,10 @@ the current configuration.
 | Commands, synchronization, and reply construction | `server/commands/commands.h`, `server/commands/commands.cpp` | One shared processor for both runners. |
 | Storage and sorted-set interfaces/adapters | `server/storage/storage.h`, `server/storage/storage.cpp` | Shared in-memory database. |
 | Hash table and augmented AVL tree | `server/storage/data_structures/` | Custom storage internals. |
+| Indexed TTL heap and key expiration | `server/storage/data_structures/min_heap.h`, `server/storage/storage.cpp` | Shared storage, synchronized by the processor. |
+| Embedded connection idle list and deadline scheduling | `server/timers/`, `server/runners/event_loop.cpp` | Event-loop mode; 60-second default idle timeout. |
 | Socket lifetime management | `net::Socket` in `common/net.h` | Shared ownership utility. |
+| Connection acceptance and closure logs | `server/runners/connection_log.h` | Both runners; fd and close reason, with a scoped closure log. |
 | Blocking receive and send-all helpers | `common/net.h` | Used by threaded mode and the client. |
 | Client UI and request/reply exchange | `client/main.cpp` | Works with either server mode. |
 
@@ -119,6 +122,9 @@ in [common/net.h](../common/net.h).
 The accept thread and each worker run independently. The successful-start arrows
 from "Create and detach worker" represent concurrent progress: the accept thread
 continues accepting while the new worker handles its own client.
+The accept thread also performs TTL maintenance. It polls before accepting,
+waking for deadlines or after at most 100 ms so workers can install new timers.
+Workers retain blocking socket I/O and do not have an idle connection timeout.
 
 The entry letters are **A** (accept), **H** (initialize the worker), **P** (parse),
 **R** (execute and reply), and **C** (close this client). Each numbered stage is
@@ -128,16 +134,21 @@ read from top to bottom; its connector names the next stage or repeated step.
 flowchart TB
     subgraph TAccept ["1. Accept thread: runThreadedServer"]
         direction TB
-        TA["A: blocking accept()<br/>Wait for a connection"]
+        TA["A: poll listener and TTLs<br/>Sleep at most 100 ms<br/>Process due key expirations"]
+        TReady{"Listener readable?"}
+        TAcceptFD["Nonblocking accept()<br/>Take the ready connection"]
         TAR{"accept result?"}
         TSpawn["Create and detach worker<br/>handleClient(fd, commands)"]
         TNext(["Return to A<br/>Accept another client"])
         TNew(["New worker: go to H<br/>Runs independently"])
         TSpawnFail["Worker creation failed<br/>Log and close accepted fd"]
         TStop(["Fatal accept error<br/>Return 1; server exits"])
-        TA --> TAR
+        TA --> TReady
+        TReady -->|"No"| TNext
+        TReady -->|"Yes"| TAcceptFD
+        TAcceptFD --> TAR
         TAR -->|"Client fd"| TSpawn
-        TAR -->|"EINTR"| TNext
+        TAR -->|"EINTR, EAGAIN, aborted"| TNext
         TAR -->|"Other error"| TStop
         TSpawn -->|"Accept thread"| TNext
         TSpawn -->|"Worker starts"| TNew
@@ -229,6 +240,13 @@ A `Conn` retains the work that must survive a handler returning:
 | `output` | One pending encoded reply. |
 | `sent` | Number of bytes already accepted by `send()` from that reply. |
 | `closeAfterWrite` | Close after draining a protocol-error reply. |
+| `idle_node` | Embedded next/previous connection pointers in the idle list. |
+| `last_active_ms` | Monotonic time of acceptance or last successful read/write. |
+| `closeLog` | Logs the fd and closure reason before the owned socket is destroyed. |
+
+`EventLoopState` owns `fd2Conn` and borrows its connections in the idle list.
+The shared storage backend owns the TTL heap. See [TIMERS.md](TIMERS.md) for
+timer ownership, the two structures, and the full scheduling flow.
 
 The diagram separates the poll cycle from the handlers into six numbered stages.
 Their lettered connectors make each continuation explicit:
@@ -254,19 +272,19 @@ flowchart TB
     subgraph ESetup ["1. Select buffer and wait for readiness"]
         direction TB
         EStart["Choose buffer once<br/>regular: string erase<br/>offset: advance read position<br/>Make listener nonblocking"]
-        EPoll["A: rebuild poll list<br/>Listener: POLLIN<br/>Request clients: POLLIN<br/>Response clients: POLLOUT<br/>Call poll with timeout -1"]
+        EPoll["A: rebuild poll list<br/>Listener: POLLIN<br/>Request clients: POLLIN<br/>Response clients: POLLOUT<br/>Poll with nextTimerMS()"]
         EPollResult{"poll result?"}
         EListener{"Listener reports<br/>ERR, HUP, or NVAL?"}
-        EAccept["If listener has POLLIN:<br/>handleNewConnections()<br/>Accept up to 64 clients<br/>Make each fd nonblocking<br/>Store a new Request-state Conn"]
+        EAccept["If listener has POLLIN:<br/>handleNewConnections()<br/>Accept up to 64 clients<br/>Make each fd nonblocking<br/>Store Conn and append idle node"]
         EAcceptResult{"Fatal accept error?"}
         EStop(["Return 1<br/>Server exits"])
-        EAgain(["Return to A<br/>Rebuild list and poll again"])
+        EAgain(["Process timers; return to A<br/>Rebuild list and poll again"])
         EStart -->|"Success"| EPoll
         EStart -->|"fcntl failure"| EStop
         EPoll --> EPollResult
         EPollResult -->|"EINTR"| EAgain
         EPollResult -->|"Other error"| EStop
-        EPollResult -->|"Events available"| EListener
+        EPollResult -->|"Events or timeout"| EListener
         EListener -->|"Yes"| EStop
         EListener -->|"No"| EAccept
         EAccept --> EAcceptResult
@@ -280,7 +298,7 @@ flowchart TB
         EEvents{"This fd has revents?"}
         EFault{"POLLERR or POLLNVAL?"}
         EReadGate{"Request state and<br/>POLLIN or POLLHUP?"}
-        EClients -->|"No"| EDToPoll(["Return to A<br/>Next poll cycle"])
+        EClients -->|"No"| EDToPoll(["Process idle and TTL timers<br/>Return to A: next poll cycle"])
         EClients -->|"Yes: inspect next fd"| EEvents
         EEvents -->|"Yes"| EFault
         EFault -->|"No"| EReadGate
@@ -378,7 +396,7 @@ flowchart TB
         EException["Handler throws std::exception<br/>Catch and log it"]
         EException --> EEnd
         ECleanup["Remove this connection"]
-        EClose["fd2Conn[fd].reset()<br/>Destroy Conn and close fd<br/>Shared database remains"]
+        EClose["Unlink embedded idle node<br/>fd2Conn[fd].reset()<br/>Destroy Conn and close fd<br/>Shared database remains"]
         EContinue(["Return to B<br/>Visit next snapshot client"])
         EEnd --> ECleanup
         ECleanup --> EClose
@@ -402,6 +420,9 @@ the operation is retried. `POLLIN` indicates possible readable input, `POLLOUT`
 possible write capacity, and `POLLHUP` a hangup that can accompany unread bytes.
 `POLLERR` and `POLLNVAL` end a client connection immediately. Readiness flags are
 hints: `recv()`/`send()` still determine how much progress is possible.
+After the read/write handlers return, a live connection that transferred bytes
+refreshes its timestamp and moves to the idle-list back. Once all snapshot clients
+have been visited, timer processing closes due idle connections and expires keys.
 
 **How to follow the event-loop chart:**
 
@@ -473,7 +494,8 @@ Both runners have the same entry-point shape, declared in
 ```cpp
 int runThreadedServer(int listener, std::shared_ptr<CommandProcessor> commands);
 int runEventLoopServer(int listener, std::shared_ptr<CommandProcessor> commands,
-                       InputBufferMode bufferMode = InputBufferMode::Offset);
+                       InputBufferMode bufferMode = InputBufferMode::Offset,
+                       std::uint64_t idleTimeoutMS = timers::DefaultIdleTimeoutMS);
 ```
 
 `main()` owns the listener through `net::Socket`; the runner receives its borrowed
@@ -540,8 +562,11 @@ connections use the same database through simple interfaces described in
 [STORAGE.md](STORAGE.md). Backend replacement happens at construction; no STL
 production backend is installed yet. [COMMANDS.md](COMMANDS.md) lists the commands.
 
-Chapters 12–13 would add connection timers and key expiration. They are not
-implemented here. The database has no persistence and starts empty after restart.
+Chapters 12–13 are implemented with an embedded connection idle list, an indexed
+TTL heap, and timer-aware polling. Idle timeouts apply to event-loop connections;
+TTL commands and expiration work in both modes. See [TIMERS.md](TIMERS.md).
+Chapter 14's thread pool remains future work. The database has no disk persistence
+and starts empty after restart.
 
 See [README.md](../README.md) for build/run instructions,
 [PROJECT_DETAILS.md](PROJECT_DETAILS.md) for the chapter progression, and

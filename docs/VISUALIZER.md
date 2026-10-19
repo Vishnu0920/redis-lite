@@ -37,6 +37,8 @@ The pipeline demo uses a protocol-capable client. The repository's normal CLI
 calls `query()` sequentially and waits for each reply. The visualization focuses
 on one connection and the selected scenarios; it is not a benchmark or an exhaustive
 simulation of all possible socket errors, signals, or concurrent connections.
+It illustrates the earlier request/buffer milestone: TTL commands and connection
+idle timers are described in [TIMERS.md](TIMERS.md) and are not simulated here.
 
 Commands use UTF-8 byte lengths. The editor has a 16 KiB total request limit and
 a 1,000-step trace limit for manageable playback. Larger deliveries or send chunks

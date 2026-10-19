@@ -2,6 +2,7 @@
 #include "resp.h"
 
 #include <arpa/inet.h>
+#include <charconv>
 #include <cstdio>
 #include <iomanip>
 #include <iostream>
@@ -20,6 +21,45 @@ void printReply(const resp::ReplyResult& reply, const std::string& indent = "") 
         if (reply.type == '-') std::cout << "(error) ";
         std::cout << reply.value << '\n';
     }
+}
+
+// Interpret timer replies using the command that produced them. Other commands
+// (and all RESP errors) keep the usual generic reply display.
+bool printTimerReply(const std::vector<std::string>& args, const resp::ReplyResult& reply) {
+    if (args.empty() || reply.type != ':') return false;
+    std::string name = args[0];
+    for (char& ch : name) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+
+    if (name == "TTL" && args.size() == 2) {
+        if (reply.integer == -1) std::cout << "No timer for this key.\n";
+        else if (reply.integer == -2) std::cout << "Timer expired or key does not exist.\n";
+        else if (reply.integer == 0) std::cout << "Less than 1 second remaining.\n";
+        else if (reply.integer > 0) {
+            std::cout << "Time remaining: " << reply.integer
+                      << (reply.integer == 1 ? " second.\n" : " seconds.\n");
+        } else return false;
+        return true;
+    }
+    if (name == "EXPIRE" && args.size() == 3 && (reply.integer == 0 || reply.integer == 1)) {
+        std::int64_t seconds;
+        const auto& text = args[2];
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), seconds);
+        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) return false;
+        if (reply.integer == 0) {
+            std::cout << "Key does not exist or has expired; no timer was set.\n";
+        } else if (seconds <= 0) {
+            std::cout << "Key deleted immediately (nonpositive TTL).\n";
+        } else {
+            std::cout << "Timer set to " << seconds << (seconds == 1 ? " second.\n" : " seconds.\n");
+        }
+        return true;
+    }
+    if (name == "PERSIST" && args.size() == 2 && (reply.integer == 0 || reply.integer == 1)) {
+        if (reply.integer == 1) std::cout << "Timer removed; this key has no expiration.\n";
+        else std::cout << "No timer to remove (key has no timer or does not exist).\n";
+        return true;
+    }
+    return false;
 }
 
 bool query(int fd, const std::vector<std::string>& args, std::string& input) {
@@ -54,7 +94,7 @@ bool query(int fd, const std::vector<std::string>& args, std::string& input) {
         }
 
         if (reply.status == resp::Status::Complete) { //if the repsonse is complete that means we have recieved the full response
-            printReply(reply);
+            if (!printTimerReply(args, reply)) printReply(reply);
             input.erase(0, reply.consumed); //clear the input buffer uptill whatever is consumed
             return true;
         }
@@ -104,7 +144,7 @@ int main(int argc, char* argv[]) {
     }
 
     //Otherwise if we are just starting the client then it should handle multiple commands hence we will setup the loop
-    std::cout << "Commands: PING, ECHO, GET, SET, DEL, KEYS, ZADD, ZREM, ZSCORE, ZRANK, ZCARD, ZQUERY.\n"
+    std::cout << "Commands: PING, ECHO, GET, SET, DEL, KEYS, ZADD, ZREM, ZSCORE, ZRANK, ZCARD, ZQUERY, EXPIRE, TTL, PERSIST.\n"
               << "See docs/COMMANDS.md for syntax. Type exit to leave.\n";
     std::string line;
     while (std::cout << "redis> " && std::getline(std::cin, line)) { //print redis> and wait for the user to enter a line and input and store that line in the line variable

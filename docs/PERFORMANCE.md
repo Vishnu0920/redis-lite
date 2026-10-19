@@ -165,4 +165,8 @@ server modes; threaded-mode measurements include contention on that mutex.
 PING/ECHO bypass it. The custom hash table migrates progressively, and sorted sets
 use an augmented AVL tree. STL backends remain future comparison work, with
 replacement boundaries described in [STORAGE.md](STORAGE.md). No benchmark results
-are claimed; timers, TTL, and background deletion are not yet implemented.
+are claimed. Optional TTLs now use an indexed min-heap, and event-loop connections
+have a 60-second idle timeout by default. Record the idle timeout and TTL workload
+in comparisons; long idle-client tests need activity refreshes or a suitable
+`--idle-timeout-ms` value. Threaded-mode TTL maintenance wakes at most every 100 ms.
+Key destruction remains synchronous; background deletion is future work.

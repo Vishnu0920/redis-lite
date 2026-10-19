@@ -45,6 +45,16 @@ CommandProcessor::CommandProcessor(std::unique_ptr<storage::Storage> store) : st
     if (!store_) throw std::invalid_argument("storage is required");
 }
 
+std::optional<std::uint64_t> CommandProcessor::nextTTLDeadlineMS() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return store_->nextTTLDeadlineMS();
+}
+
+void CommandProcessor::processTTLExpirations(std::uint64_t now) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    store_->processTTLExpirations(now);
+}
+
 std::string CommandProcessor::execute(const std::vector<std::string>& args) {
     if (args.empty()) return resp::error("ERR empty command");
     std::string name = args[0];
@@ -63,6 +73,26 @@ std::string CommandProcessor::execute(const std::vector<std::string>& args) {
     // Storage operations and the reply snapshot are atomic across client threads.
     // PING/ECHO don't access storage and avoid this mutex.
     std::lock_guard<std::mutex> lock(mutex_);
+    if (name == "EXPIRE") {
+        if (args.size() != 3) return wrongArity(name);
+        std::int64_t seconds;
+        if (!parseInteger(args[2], seconds)) {
+            return resp::error("ERR value is not an integer or out of range");
+        }
+        try {
+            return resp::integer(store_->expire(args[1], seconds));
+        } catch (const std::overflow_error&) {
+            return resp::error("ERR invalid expire time");
+        }
+    }
+    if (name == "TTL") {
+        if (args.size() != 2) return wrongArity(name);
+        return resp::integer(store_->ttl(args[1]));
+    }
+    if (name == "PERSIST") {
+        if (args.size() != 2) return wrongArity(name);
+        return resp::integer(store_->persist(args[1]));
+    }
     if (name == "GET") {
         if (args.size() != 2) return wrongArity(name);
         auto result = store_->get(args[1]);

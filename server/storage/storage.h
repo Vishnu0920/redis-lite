@@ -1,5 +1,7 @@
 #pragma once
 
+#include "timers/time.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -43,6 +45,14 @@ public:
     virtual void set(std::string_view key, std::string_view value) = 0;
     virtual bool erase(std::string_view key) = 0;
     virtual std::vector<std::string> keys() = 0;
+    // Public TTL values are seconds. Nonpositive EXPIRE deletes immediately;
+    // positive values that cannot fit the internal deadline throw overflow_error.
+    virtual bool expire(std::string_view key, std::int64_t seconds) = 0;
+    virtual std::int64_t ttl(std::string_view key) = 0; // -2 missing, -1 permanent.
+    virtual bool persist(std::string_view key) = 0;
+    virtual std::optional<std::uint64_t> nextTTLDeadlineMS() const = 0;
+    virtual std::size_t processTTLExpirations(std::uint64_t now,
+                                             std::size_t limit = timers::ExpirationBudget) = 0;
     virtual Result<std::size_t> zadd(std::string_view key, const std::vector<ScoredMember>& members) = 0;
     virtual Result<std::size_t> zrem(std::string_view key, const std::vector<std::string>& members) = 0;
     virtual Result<double> zscore(std::string_view key, std::string_view member) = 0;
@@ -55,5 +65,7 @@ public:
 
 std::unique_ptr<SortedSet> makeCustomSortedSet();
 using SortedSetFactory = std::unique_ptr<SortedSet> (*)();
-std::unique_ptr<Storage> makeCustomStorage(SortedSetFactory sortedSets = makeCustomSortedSet);
+using MillisecondClock = std::uint64_t (*)();
+std::unique_ptr<Storage> makeCustomStorage(SortedSetFactory sortedSets = makeCustomSortedSet,
+                                          MillisecondClock clock = timers::monotonicMS);
 } // namespace storage
